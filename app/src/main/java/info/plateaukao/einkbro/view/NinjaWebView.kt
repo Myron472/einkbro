@@ -11,10 +11,12 @@ import android.os.Build
 import android.os.SystemClock
 import android.print.PrintDocumentAdapter
 import android.util.Base64
+import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ViewGroup
 import android.webkit.CookieManager
+import android.webkit.ValueCallback
 import android.webkit.WebSettings
 import android.webkit.WebView
 import androidx.webkit.WebSettingsCompat
@@ -50,7 +52,6 @@ import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
 import java.io.ByteArrayOutputStream
 import java.io.IOException
-import java.io.InputStream
 import kotlin.coroutines.resume
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.ceil
@@ -127,10 +128,7 @@ open class NinjaWebView(
                     (if (config.boldFontStyle)
                         boldFontCss.replace("value", "${config.fontBoldness}") else "") +
                     // all css are purged by epublib. need to add it back if it's epub reader mode
-                    if (isEpubReaderMode) String(
-                        getByteArrayFromAsset("readerview.css"),
-                        Charsets.UTF_8
-                    ) else ""
+                    if (isEpubReaderMode) loadAssetFile(context, "readerview.css") else ""
         if (cssStyle.isNotBlank()) {
             injectCss(cssStyle.toByteArray())
         }
@@ -683,23 +681,6 @@ open class NinjaWebView(
         }
     }
 
-    suspend fun getRawHtml() = suspendCoroutine { continuation ->
-        if (rawHtmlCache != null) {
-            continuation.resume(rawHtmlCache)
-            return@suspendCoroutine
-        }
-
-        evaluateJavascript(
-            "(function() { return ('<html>'+document.getElementsByTagName('html')[0].innerHTML+'</html>'); })();"
-        ) { html ->
-            val processedHtml = StringEscapeUtils.unescapeJava(html)
-            val rawHtml =
-                processedHtml.substring(1, processedHtml.length - 1) // handle prefix/postfix
-            rawHtmlCache = rawHtml
-            continuation.resume(rawHtml)
-        }
-    }
-
     // only works in isReadModeOn
     suspend fun getRawText() = suspendCoroutine<String> { continuation ->
         if (!isReaderModeOn) {
@@ -801,27 +782,25 @@ open class NinjaWebView(
             TranslationTextStyle.BOLD -> translatedPCssBold
         }
         injectCss(textBlockStyle.toByteArray())
-        evaluateJavascript(translateParagraphJs) {
-            evaluateJavascript(textNodesMonitorJs, null)
+        evaluateJsFile("translate_by_paragraph.js") {
+            evaluateJsFile("text_node_monitor.js", false)
             isTranslateByParagraph = true
         }
     }
 
     fun showTranslation() = browserController?.showTranslation(this)
 
-    fun addSelectionChangeListener() {
-        evaluateJavascript(textSelectionChangeJs, null)
-    }
+    fun addSelectionChangeListener() = evaluateJsFile("text_selection_change.js")
 
     private var isHighlightCssInjected = false
     fun highlightTextSelection(highlightStyle: HighlightStyle) {
         if (!isHighlightCssInjected) {
-            injectCss(getByteArrayFromAsset("highlight.css"))
+            injectCss(loadAssetFile(context, "highlight.css").toByteArray())
             isHighlightCssInjected = true
         }
 
         if (highlightStyle == HighlightStyle.BACKGROUND_NONE) {
-            evaluateJavascript(removeHighlightJs, null)
+            evaluateJsFile("remove_text_highlight.js")
         } else {
             val className = when (highlightStyle) {
                 HighlightStyle.UNDERLINE -> "highlight_underline"
@@ -832,7 +811,9 @@ open class NinjaWebView(
                 else -> ""
             }
 
-            evaluateJavascript(String.format(selectionHighlightJs, className), null)
+            evaluateJavascript(
+                String.format(loadAssetFile(context, "text_selection_highlight.js"), className).wrapJsFunction(), null
+            )
         }
     }
 
@@ -862,22 +843,24 @@ open class NinjaWebView(
         postAction: (() -> Unit)? = null,
     ) {
         val cssByteArray =
-            getByteArrayFromAsset(if (isVertical) "verticalReaderview.css" else "readerview.css")
+            loadAssetFile(context, if (isVertical) "verticalReaderview.css" else "readerview.css").toByteArray()
         injectCss(cssByteArray)
         if (isVertical) injectCss(verticalLayoutCss.toByteArray())
 
         val jsString = HelperUnit.getStringFromAsset("MozReadability.js")
         evaluateJavascript(jsString) {
-            //evaluateJavascript("javascript:(function() { window.scrollTo(0, 0); })()", null)
             postAction?.invoke()
         }
     }
 
     private fun injectMozReaderModeJs(isVertical: Boolean = false) {
         try {
-            val buffer = getByteArrayFromAsset("MozReadability.js")
+            val buffer = loadAssetFile(context, "MozReadability.js").toByteArray()
             val cssBuffer =
-                getByteArrayFromAsset(if (isVertical) "verticalReaderview.css" else "readerview.css")
+                loadAssetFile(
+                    context,
+                    if (isVertical) "verticalReaderview.css" else "readerview.css"
+                ).toByteArray()
 
             val verticalCssString = if (isVertical) {
                 "var style = document.createElement('style');" +
@@ -929,21 +912,6 @@ open class NinjaWebView(
         }
     }
 
-    private fun getByteArrayFromAsset(fileName: String): ByteArray {
-        return try {
-            val assetInput: InputStream = context.assets.open(fileName)
-            val buffer = ByteArray(assetInput.available())
-            assetInput.read(buffer)
-            assetInput.close()
-
-            buffer
-        } catch (e: IOException) {
-            // TODO Auto-generated catch block
-            e.printStackTrace()
-            ByteArray(0)
-        }
-    }
-
     private fun injectCss(bytes: ByteArray) {
         try {
             val encoded = Base64.encodeToString(bytes, Base64.NO_WRAP)
@@ -968,21 +936,15 @@ open class NinjaWebView(
         }
     }
 
-    fun selectSentence(point: Point) {
-        evaluateJavascript(jsSelectSentence) {
-            this.postDelayed({ simulateClick(point) }, 100)
-        }
-    }
+    fun selectSentence(point: Point) =
+        evaluateJsFile("select_sentence.js") { this.postDelayed({ simulateClick(point) }, 100) }
 
-    fun selectParagraph(point: Point) {
-        evaluateJavascript(jsSelectParagraph) {
-            this.postDelayed({ simulateClick(point) }, 100)
-        }
-    }
+    fun selectParagraph(point: Point) =
+        evaluateJsFile("select_paragraph.js") { this.postDelayed({ simulateClick(point) }, 100) }
 
     suspend fun getSelectedTextWithContext(contextLength: Int = 10): String =
         suspendCoroutine { continuation ->
-            evaluateJavascript(jsGetSelectedTextWithContextV2) { value ->
+            evaluateJsFile("get_selected_text_with_context.js") { value ->
                 continuation.resume(value.substring(1, value.length - 1))
             }
         }
@@ -1007,134 +969,40 @@ open class NinjaWebView(
         dispatchKeyEvent(upEvent)
     }
 
+    private fun evaluateJsFile(fileName: String, withPrefix: Boolean = true, callback: ValueCallback<String>? = null) {
+        val jsContent = loadAssetFile(context, fileName)
+        if (withPrefix) {
+            evaluateJavascript(jsContent.wrapJsFunction(), callback)
+        } else {
+            evaluateJavascript(jsContent, callback)
+        }
+    }
+
     companion object {
         private const val FAKE_PRE_PROGRESS = 5
 
-        private const val jsSelectParagraph = """
-            javascript:(function () {
-    let selection = window.getSelection();
-    if (selection.rangeCount === 0) return;
+        // load javascript from asset and save to a cache list for later use
+        private val jsCache = mutableMapOf<String, String>()
+        private fun loadAssetFile(context: Context, fileName: String): String {
+            if (jsCache.containsKey(fileName)) {
+                return jsCache[fileName]!!
+            }
 
-    let range = selection.getRangeAt(0);
-    let startContainer = range.startContainer;
-    let endContainer = range.endContainer;
-
-    // Check if the selection is within a single text node
-    if (startContainer !== endContainer || startContainer.nodeType !== Node.TEXT_NODE) {
-        return;
-    }
-
-    let textContent = startContainer.textContent;
-    let startOffset = range.startOffset;
-    let endOffset = range.endOffset;
-
-    let paragraphStart = startOffset;
-    let paragraphEnd = endOffset;
-
-    // Move the start of the range to the start of the paragraph (i.e., look for newline or start of the node)
-    while (paragraphStart > 0 && textContent[paragraphStart - 1] !== '\n') {
-        paragraphStart--;
-    }
-
-    // Move the end of the range to the end of the paragraph (i.e., look for newline or end of the node)
-    while (paragraphEnd < textContent.length && textContent[paragraphEnd] !== '\n') {
-        paragraphEnd++;
-    }
-
-    // Set the range to the paragraph boundaries
-    range.setStart(startContainer, paragraphStart);
-    range.setEnd(startContainer, paragraphEnd);
-
-    // Clear previous selection and set the new one
-    selection.removeAllRanges();
-    selection.addRange(range);
-})();
-        """
-        private const val jsSelectSentence = """
-            javascript:(function () {
-    let selection = window.getSelection();
-    if (selection.rangeCount === 0) return;
-
-    let range = selection.getRangeAt(0);
-    let startContainer = range.startContainer;
-    let endContainer = range.endContainer;
-
-    if (startContainer !== endContainer || startContainer.nodeType !== Node.TEXT_NODE) {
-        // Only handle cases where the selection is within a single text node
-        return;
-    }
-
-    let textContent = startContainer.textContent;
-    let startOffset = range.startOffset;
-    let endOffset = range.endOffset;
-
-    let sentenceStart = startOffset;
-    let sentenceEnd = endOffset;
-
-    // Move the start of the range to the start of the sentence
-    while (sentenceStart > 0 && ![".", "?", "。", "!"].includes(textContent[sentenceStart - 1])) {
-        sentenceStart--;
-    }
-
-    // Move the end of the range to the end of the sentence
-    while (sentenceEnd < textContent.length && ![".", "?", "。", "!"].includes(textContent[sentenceEnd])) {
-        sentenceEnd++;
-    }
-
-    // Set the range to the sentence boundaries
-    range.setStart(startContainer, sentenceStart);
-    range.setEnd(startContainer, sentenceEnd);
-
-    // Clear previous selection and set the new one
-    selection.removeAllRanges();
-    selection.addRange(range);
-            })();
-        """
-
-        private const val jsGetSelectedTextWithContextV2 = """
-            javascript:(function() {
-    let contextLength = 120;
-    let selection = window.getSelection();
-    if (selection.rangeCount === 0) return "";
-
-    let range = selection.getRangeAt(0);
-    let startContainer = range.startContainer;
-    let endContainer = range.endContainer;
-
-    // Handle the case where the selected text spans multiple nodes
-    if (startContainer !== endContainer) {
-        return "";  // For simplicity, not handling multi-node selections here
-    }
-
-    let textContent = startContainer.textContent;
-    let startOffset = range.startOffset;
-    let endOffset = range.endOffset;
-
-    // Extend previousContext to the previous ".", "。", "?", or "!"
-    let contextStartPos = startOffset;
-    while (contextStartPos > 0 && ![".", "。", "?", "!"].includes(textContent[contextStartPos - 1])) {
-        contextStartPos--;
-        if (startOffset - contextStartPos > contextLength) {
-            break;
+            try {
+                val jsContent = context.assets.open(fileName).bufferedReader().use { it.readText() }
+                jsCache[fileName] = jsContent
+                return jsContent
+            } catch (e: IOException) {
+                Log.e("NinjaWebView", "Failed to load asset file: $fileName")
+                e.printStackTrace()
+                return ""
+            }
         }
-    }
 
-    // Extend nextContext to the next ".", "?", or "。"
-    let contextEndPos = endOffset;
-    while (contextEndPos < textContent.length && ![".", "?", "。"].includes(textContent[contextEndPos])) {
-        contextEndPos++;
-        if (contextEndPos - endOffset > contextLength) {
-            break;
+        // make a String extension to wrap it with Javascript function
+        private fun String.wrapJsFunction(): String {
+            return "javascript:(function() { $this })()"
         }
-    }
-
-    let previousContext = textContent.substring(contextStartPos, startOffset);
-    let nextContext = textContent.substring(endOffset, contextEndPos+1);
-
-    let selectedText = selection.toString();
-    return previousContext + "<<" + selectedText + ">>" + nextContext;
-})();
-        """
 
         private const val secondPart =
             """setTimeout(
@@ -1241,44 +1109,6 @@ open class NinjaWebView(
           }
         """
 
-        const val textNodesMonitorJs = """
-            //const bridge = window.android = new androidApp(context, webView);
-            
-            function myCallback(elementId, responseString) {
-                //console.log("Element ID:", elementId, "Response string:", responseString);
-                node = document.getElementById(elementId).nextElementSibling;
-                node.textContent = responseString;
-                node.classList.add("translated");
-            }
-            
-            // Create a new IntersectionObserver object
-            observer = new IntersectionObserver((entries) => {
-              entries.forEach((entry) => {
-                // Check if the target node is currently visible
-                if (entry.isIntersecting) {
-                  //console.log('Node is visible:', entry.target.textContent);
-                  const nextNode = entry.target.nextElementSibling;
-                          //nextNode.textContent = result;
-                  if (nextNode && nextNode.textContent === "") {
-                      androidApp.getTranslation(entry.target.textContent, entry.target.id, "myCallback");
-                  }
-                } else {
-                  // The target node is not visible
-                  //console.log('Node is not visible');
-                }
-              });
-            });
-
-            // Select all elements with class name 'to-translate'
-            targetNodes = document.querySelectorAll('.to-translate');
-
-            // Loop through each target node and start observing it
-            targetNodes.forEach((targetNode) => {
-              observer.observe(targetNode);
-            });
-        """
-
-
         private const val readabilityOptions =
             "{classesToPreserve: preservedClasses, overwriteImgSrc: true}"
 
@@ -1309,30 +1139,6 @@ open class NinjaWebView(
                 var documentClone = document.cloneNode(true);
                 var article = new Readability(documentClone, $readabilityOptions).parse();
                 return article.title + ', ' + article.textContent;
-            })()
-        """
-        private const val stripHeaderElementsJs = """
-            javascript:(function() {
-                var r = document.getElementsByTagName('script');
-                for (var i = (r.length-1); i >= 0; i--) {
-                    if(r[i].getAttribute('id') != 'a'){
-                        r[i].parentNode.removeChild(r[i]);
-                    }
-                }
-            })()
-        """
-
-        private const val oldFacebookHideSponsoredPostsJs = """
-            javascript:(function() {
-            var posts = [].filter.call(document.getElementsByTagName('article'), el => el.attributes['data-store'].value.indexOf('is_sponsored.1') >= 0); 
-            while(posts.length > 0) { posts.pop().style.display = "none"; }
-            
-            var qcleanObserver = new window.MutationObserver(function(mutation, observer){ 
-               var posts = [].filter.call(document.getElementsByTagName('article'), el => el.attributes['data-store'].value.indexOf('is_sponsored.1') >= 0); 
-               while(posts.length > 0) { posts.pop().style.display = "none"; }
-            });
-            
-            qcleanObserver.observe(document, { subtree: true, childList: true });
             })()
         """
 
@@ -1448,234 +1254,11 @@ input[type=button]: focus,input[type=submit]: focus,input[type=reset]: focus,inp
                 "\tfont-weight:value !important;\n" +
                 "}\n"
 
-        private const val textSelectionChangeJs = """
-            var selectedText = "";
-            function getSelectionPositionInWebView() {
-    let selection = window.getSelection();
-    
-    if (selection) {
-        let range = selection.getRangeAt(0);
-        let startNode = range.startContainer;
-        let startOffset = range.startOffset;
-        let endNode = range.endContainer;
-        let endOffset = range.endOffset;
-        
-        let start = getRectInWebView(startNode, startOffset);
-        let end = getRectInWebView(endNode, endOffset);
-        
-            // Send anchor position to Android
-            if (selection.toString() != selectedText) {
-                selectedText = selection.toString();
-                if (selectedText.length > 0) {
-                    androidApp.getAnchorPosition(start.left, start.top, end.right, end.bottom);
-                }
-            }
-    }
-}
-
-function getRectInWebView(node, offset) {
-    let range = document.createRange();
-    range.setStart(node, offset);
-    range.setEnd(node, offset);
-    let rect = range.getBoundingClientRect();
-
-    return rect;
-}
-
-// Call the function to get selection position
-document.addEventListener("selectionchange", function() {
-    getSelectionPositionInWebView();
-    });
-        """
-
-        private const val removeHighlightJs = """
-            javascript:(function() {
-            function removeHighlightFromSelection() {
-    const selection = window.getSelection();
-    // 檢查是否有選取範圍
-    if (!selection.rangeCount) return;
-    const range = selection.getRangeAt(0);
-    const container = range.commonAncestorContainer;
-    // 確保範圍是在一個元素內部
-    const parentElement = container.nodeType === 3 ? container.parentNode : container;
-
-    // 查找所有的 highlight divs
-    const highlights = parentElement.parentNode.querySelectorAll('div.highlight_underline, div.highlight_yellow, div.highlight_green, div.highlight_blue, div.highlight_pink');
-
-    // 移除每個 highlight div 的外部 HTML
-    highlights.forEach(highlight => {
-        highlight.outerHTML = highlight.innerHTML;
-    });
-}
-
-// 綁定一個按鈕來觸發這個函數
-removeHighlightFromSelection();
-            })()
-        """
-
-        private const val selectionHighlightJs = """
-            javascript:(function() {
-                function highlightSelection() {
-  var userSelection = window.getSelection().getRangeAt(0);
-  var safeRanges = getSafeRanges(userSelection);
-  for (var i = 0; i < safeRanges.length; i++) {
-    highlightRange(safeRanges[i]);
-  }
-}
-
-function highlightRange(range) {
-  var newNode = document.createElement("div");
-  newNode.className = "%s"
-  range.surroundContents(newNode);
-}
-
-function getSafeRanges(dangerous) {
-  var a = dangerous.commonAncestorContainer;
-  // Starts -- Work inward from the start, selecting the largest safe range
-  var s = new Array(0), rs = new Array(0);
-  if (dangerous.startContainer != a) {
-    for (var i = dangerous.startContainer; i != a; i = i.parentNode) {
-      s.push(i);
-    }
-  }
-  if (s.length > 0) {
-    for (var i = 0; i < s.length; i++) {
-      var xs = document.createRange();
-      if (i) {
-        xs.setStartAfter(s[i - 1]);
-        xs.setEndAfter(s[i].lastChild);
-      } else {
-        xs.setStart(s[i], dangerous.startOffset);
-        xs.setEndAfter((s[i].nodeType == Node.TEXT_NODE) ? s[i] : s[i].lastChild);
-      }
-      rs.push(xs);
-    }
-  }
-
-  // Ends -- basically the same code reversed
-  var e = new Array(0), re = new Array(0);
-  if (dangerous.endContainer != a) {
-    for (var i = dangerous.endContainer; i != a; i = i.parentNode) {
-      e.push(i);
-    }
-  }
-  if (e.length > 0) {
-    for (var i = 0; i < e.length; i++) {
-      var xe = document.createRange();
-      if (i) {
-        xe.setStartBefore(e[i].firstChild);
-        xe.setEndBefore(e[i - 1]);
-      } else {
-        xe.setStartBefore((e[i].nodeType == Node.TEXT_NODE) ? e[i] : e[i].firstChild);
-        xe.setEnd(e[i], dangerous.endOffset);
-      }
-      re.unshift(xe);
-    }
-  }
-
-  // Middle -- the uncaptured middle
-  if ((s.length > 0) && (e.length > 0)) {
-    var xm = document.createRange();
-    xm.setStartAfter(s[s.length - 1]);
-    xm.setEndBefore(e[e.length - 1]);
-  } else {
-    return [dangerous];
-  }
-
-  // Concat
-  rs.push(xm);
-  response = rs.concat(re);
-
-  // Send to Console
-  return response;
-}
-
-highlightSelection();
-            })();
-            """
         private val clearTranslationElementsJs = """
             javascript:(function() {
                 document.body.innerHTML = document.originalInnerHTML;
                 document.body.classList.remove("translated");
             })()
-        """.trimIndent()
-        private val translateParagraphJs = """
-            function fetchNodesWithText(element) {
-              var result = [];
-              for (var i = 0; i < element.children.length; i++) {
-                var child = element.children[i];
-                // bypass non-necessary element
-                if (
-                  child.getAttribute("data-tiara-action-name") === "헤드글씨크기_클릭" ||
-                  child.innerText === "original link"
-                ) {
-                  continue;
-                }
-                if (child.closest('img, button, code') || child.tagName === "SCRIPT"
-                      || child.classList.contains("screen_out")
-                      || child.classList.contains("blind")
-                      || child.classList.contains("ico_view")
-                ) {
-                  continue;
-                }
-                if (
-                  ["p", "h1", "h2", "h3", "h4", "h5", "h6", "span", "strong"].includes(child.tagName.toLowerCase()) ||
-                  (child.children.length == 0 && child.innerText != "")
-                ) {
-                  if (child.innerText !== "") {
-                    injectTranslateTag(child);
-                    console.log(child.textContent + "\n\n");
-                    result.push(child);
-                  }
-                } else {
-                  result.push(fetchNodesWithText(child));
-                }
-              }
-              return result;
-            }
-            
-            function generateUUID() {
-              var timestamp = new Date().getTime();
-              const uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
-                const random = (timestamp + Math.random() * 16) % 16 | 0;
-                timestamp = Math.floor(timestamp / 16);
-                return (c === 'x' ? random : (random & 0x3 | 0x8)).toString(16);
-              });
-
-              return uuid;
-            }
-            
-            function injectTranslateTag(node) {
-                // for monitoring visibility
-                node.className += " to-translate";
-                // for locating element's position
-                node.id = generateUUID().toString();
-                // for later inserting translated text
-               var pElement = document.createElement("p");
-               try {
-                 //node.after(pElement);
-                 node.parentNode.insertBefore(pElement, node.nextSibling);
-               } catch(error) {
-                //console.log(node.textContent);
-                //console.log(error);
-               }
-            }
-            
-            if (!document.body.classList.contains("translated")) {
-                document.body.classList.add("translated");
-                document.originalInnerHTML = document.body.innerHTML;
-                fetchNodesWithText(document.body);
-            } else {
-                if (!document.body.classList.contains("translated_but_hide")) {
-                    document.translatedInnerHTML = document.body.innerHTML;
-                    document.body.innerHTML = document.originalInnerHTML;
-                    document.body.classList.add("translated_but_hide");
-                } else {
-                    document.body.innerHTML = document.translatedInnerHTML;
-                    document.body.classList.remove("translated_but_hide");
-                }
-            }
-            
         """.trimIndent()
     }
 
